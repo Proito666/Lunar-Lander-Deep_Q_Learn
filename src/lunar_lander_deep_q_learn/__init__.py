@@ -2,26 +2,39 @@ import os
 
 import gymnasium as gym
 import numpy as np
-import pandas as pd
-import tensorflow as tf
-from tensorflow.keras.layers import Dense, Lambda
-from tensorflow.keras import backend as K
-from tensorflow.keras.models import load_model
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 # Initialise the environment
-env = gym.make("LunarLander-v3", render_mode="human")
+env = gym.make("LunarLander-v3")
 
-
-episode = 1000
-learning_rate=0.01
-reward_decay=0.9
+episode = 50000
+learning_rate=0.001
+reward_decay=0.99
 e_greedy=0.99
-e_greedy_increment=0.001
-replace_target_iter=300
-memory_size=500
-batch_size=32
-train_freq=1
-model_path = "model/dqn_eval_model.keras"
+e_greedy_increment=0.0005
+epsilon=0.
+replace_target_iter=1000
+memory_size=10000
+batch_size=64
+train_freq=5
+model_path = "model/dqn_eval_model.pth"
+render_threshold = 200
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class DQNNet(nn.Module):
+    def __init__(self, n_features, n_actions):
+        super(DQNNet, self).__init__()
+        self.fc1 = nn.Linear(n_features, 64)
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, n_actions)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
 
 class DeepQNetwork:
     def __init__(
@@ -38,7 +51,7 @@ class DeepQNetwork:
         self.memory_size = memory_size
         self.batch_size = batch_size
         self.epsilon_increment = e_greedy_increment
-        self.epsilon = 0 if e_greedy_increment is not None else self.epsilon_max
+        self.epsilon = epsilon
 
         # total learning step
         self.learn_step_counter = 0
@@ -49,43 +62,19 @@ class DeepQNetwork:
         self.cost_his = []
 
         # consist of [target_net, evaluate_net]
-        self._build_net()
-        
-        self.optimizer = tf.keras.optimizers.RMSprop(learning_rate=self.lr)
+        self.eval_net = DQNNet(n_features, n_actions).to(device)
+        self.target_net = DQNNet(n_features, n_actions).to(device)
+        self.optimizer = optim.RMSprop(self.eval_net.parameters(), lr=self.lr)
+        self.loss_fn = nn.MSELoss()
 
-    def _build_net(self):
-        # 初始化器
-        w_initializer = tf.keras.initializers.RandomNormal(0., 0.3)
-        b_initializer = tf.keras.initializers.Constant(0.1)
-
-        # 输入保持原名
-        self.s = tf.keras.Input(shape=(self.n_features,), dtype=tf.float32, name='s')
-        self.s_ = tf.keras.Input(shape=(self.n_features,), dtype=tf.float32, name='s_')
-
-        # evaluate_net
-        e1 = Dense(20, activation='relu', kernel_initializer=w_initializer,
-                bias_initializer=b_initializer, name='e1')(self.s)
-        self.q_eval = Dense(self.n_actions, kernel_initializer=w_initializer,
-                            bias_initializer=b_initializer, name='q')(e1)
-        self.eval_model = tf.keras.Model(inputs=self.s, outputs=self.q_eval)
-
-        # target_net
-        t1 = Dense(20, activation='relu', kernel_initializer=w_initializer,
-                bias_initializer=b_initializer, name='t1')(self.s_)
-        self.q_next = Dense(self.n_actions, kernel_initializer=w_initializer,
-                            bias_initializer=b_initializer, name='t2')(t1)
-        self.target_model = tf.keras.Model(inputs=self.s_, outputs=self.q_next)
-
-    def save_model(self, path="dqn_eval_model.h5"):
-        """保存 eval_model 模型，包括权重和结构"""
-        self.eval_model.save(path)
+    def save_model(self, path):
+        torch.save(self.eval_net.state_dict(), path)
         print(f"Eval model saved to {path}")
 
-    def load_model(self, path="dqn_eval_model.h5"):
-        """加载 eval_model 模型"""
-        self.eval_model = load_model(path)
-        # 同步 target_model
-        self.target_model.set_weights(self.eval_model.get_weights())
+    def load_model(self, path):
+        self.eval_net.load_state_dict(torch.load(path, map_location=device))
+        self.target_net.load_state_dict(self.eval_net.state_dict())
+
         print(f"Eval model loaded from {path} and target_model synced")
 
     def store_transition(self, s, a, r, s_):
@@ -95,10 +84,11 @@ class DeepQNetwork:
         self.memory_counter += 1
 
     def choose_action(self, observation):
-        observation = observation[np.newaxis, :].astype(np.float32)
+        obs_tensor = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
         if np.random.uniform() < self.epsilon:
-            q_eval_val = self.eval_model(observation).numpy()
-            action = np.argmax(q_eval_val)
+            with torch.no_grad():
+                actions_value = self.eval_net(obs_tensor)
+            action = torch.argmax(actions_value).item()
         else:
             action = np.random.randint(0, self.n_actions)
         return action
@@ -106,7 +96,7 @@ class DeepQNetwork:
     def learn(self):
         # 更新 target_net 参数
         if self.learn_step_counter % self.replace_target_iter == 0:
-            self.target_model.set_weights(self.eval_model.get_weights())
+            self.target_net.load_state_dict(self.eval_net.state_dict())
             print("\ntarget_params_replaced\n")
         # sample batch memory
         if self.memory_counter > self.memory_size:
@@ -115,29 +105,26 @@ class DeepQNetwork:
             sample_index = np.random.choice(self.memory_counter, size=self.batch_size)
         batch_memory = self.memory[sample_index, :]
 
-        s_batch = batch_memory[:, :self.n_features].astype(np.float32)
-        a_batch = batch_memory[:, self.n_features].astype(np.int32)
-        r_batch = batch_memory[:, self.n_features + 1].astype(np.float32)
-        s_next_batch = batch_memory[:, -self.n_features:].astype(np.float32)
+        s_batch = torch.FloatTensor(batch_memory[:, :self.n_features]).to(device)
+        a_batch = torch.LongTensor(batch_memory[:, self.n_features]).unsqueeze(1).to(device)
+        r_batch = torch.FloatTensor(batch_memory[:, self.n_features + 1]).to(device)
+        s_next_batch = torch.FloatTensor(batch_memory[:, -self.n_features:]).to(device)
 
-        with tf.GradientTape() as tape:
-            q_eval_val = self.eval_model(s_batch)
-            q_next_val = self.target_model(s_next_batch)
+        q_eval = self.eval_net(s_batch).gather(1, a_batch).squeeze()
+        with torch.no_grad():
+            q_next = self.target_net(s_next_batch)
+            q_target = r_batch + self.gamma * torch.max(q_next, dim=1)[0]
 
-            batch_indices = tf.range(q_eval_val.shape[0], dtype=tf.int32)
-            indices = tf.stack([batch_indices, a_batch], axis=1)
-            q_eval_wrt_a_val = tf.gather_nd(q_eval_val, indices)
-            q_target_val = r_batch + self.gamma * tf.reduce_max(q_next_val, axis=1)
-            loss_val = tf.reduce_mean(tf.square(q_target_val - q_eval_wrt_a_val))
+        loss = self.loss_fn(q_eval, q_target)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
-        grads = tape.gradient(loss_val, self.eval_model.trainable_variables)
-        self.optimizer.apply_gradients(zip(grads, self.eval_model.trainable_variables))
-
-        self.cost_his.append(loss_val.numpy())
-
-        # update epsilon
-        self.epsilon = min(self.epsilon + self.epsilon_increment, self.epsilon_max)
+        self.cost_his.append(loss.item())
         self.learn_step_counter += 1
+
+    def update_epsilon(self):
+        self.epsilon = min(self.epsilon + self.epsilon_increment, self.epsilon_max)
 
     def plot_cost(self):
         import matplotlib.pyplot as plt
@@ -148,9 +135,8 @@ class DeepQNetwork:
       
 
 if __name__ == "__main__":
-
     RL = DeepQNetwork(env.action_space.n, env.observation_space.shape[0])
-
+    render_enabled = False
     # 确保 model 目录存在
     os.makedirs("model", exist_ok=True)
     
@@ -165,7 +151,7 @@ if __name__ == "__main__":
 
     for ep in range(episode):
         # Reset the environment to generate the first observation
-        observation, info = env.reset(seed=42)
+        observation, info = env.reset()
         step = 0
         ep_r = 0
         while True:
@@ -175,7 +161,6 @@ if __name__ == "__main__":
             # step (transition) through the environment with the action
             # receiving the next observation, reward and if the episode has terminated or truncated
             observation_, reward, terminated, truncated, info = env.step(action)
-
             RL.store_transition(observation, action, reward, observation_)
             # If the episode has ended then we can reset to start a new episode
 
@@ -197,8 +182,16 @@ if __name__ == "__main__":
         print(
             f"Ep: {ep}",
             f"| Ep_r: {ep_r:.2f}",
-            f"| Avg_r: {all_ep_r[-1]:.2f}"
+            f"| Avg_r: {all_ep_r[-1]:.2f}",
+            f"| epsilon: {RL.epsilon:.4f}"
         )
+        if not render_enabled and all_ep_r[-1] >= render_threshold:
+            print(f"Avg_r >= {render_threshold}, enabling rendering...")
+            env.close()
+            env = gym.make("LunarLander-v3", render_mode="human")
+            render_enabled = True
+
+        RL.update_epsilon()
         # 每 N 个 episode 保存一次模型，或者根据需要保存
         if ep % 10 == 0:
             RL.save_model(model_path)
