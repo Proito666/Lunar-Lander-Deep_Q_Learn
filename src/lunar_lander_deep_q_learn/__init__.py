@@ -20,7 +20,7 @@ memory_size=10000
 batch_size=64
 train_freq=5
 model_path = "model/dqn_eval_model.pth"
-render_threshold = 200
+render_threshold = 250
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
