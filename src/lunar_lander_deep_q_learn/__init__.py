@@ -9,7 +9,7 @@ import torch.optim as optim
 # Initialise the environment
 env = gym.make("LunarLander-v3")
 
-episode = 50000
+episode = 500000
 learning_rate=0.001
 reward_decay=0.99
 e_greedy=0.99
@@ -21,6 +21,7 @@ batch_size=64
 train_freq=5
 model_path = "model/dqn_eval_model.pth"
 render_threshold = 250
+observe = 100000
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -148,6 +149,7 @@ if __name__ == "__main__":
         print("No existing model found, starting training from scratch.")
 
     all_ep_r = []
+    total_steps = 0
 
     for ep in range(episode):
         # Reset the environment to generate the first observation
@@ -164,8 +166,9 @@ if __name__ == "__main__":
             RL.store_transition(observation, action, reward, observation_)
             # If the episode has ended then we can reset to start a new episode
 
-            if RL.memory_counter > RL.batch_size and (step % train_freq  == 0):
-                RL.learn()
+            if total_steps > observe:
+                if RL.memory_counter > RL.batch_size and (step % train_freq  == 0):
+                    RL.learn()
 
             # swap observation
             observation = observation_
@@ -174,6 +177,7 @@ if __name__ == "__main__":
             if terminated or truncated:
                 break
             step += 1
+            total_steps += 1
          # 计算滑动平均奖励
         if ep == 0:
             all_ep_r.append(ep_r)
@@ -183,7 +187,8 @@ if __name__ == "__main__":
             f"Ep: {ep}",
             f"| Ep_r: {ep_r:.2f}",
             f"| Avg_r: {all_ep_r[-1]:.2f}",
-            f"| epsilon: {RL.epsilon:.4f}"
+            f"| epsilon: {RL.epsilon:.4f}",
+            f"| total_steps: {total_steps}"
         )
         if not render_enabled and all_ep_r[-1] >= render_threshold:
             print(f"Avg_r >= {render_threshold}, enabling rendering...")
